@@ -1142,9 +1142,10 @@ class RealtimeSession(llm.RealtimeSession):
         return conf
 
     def _start_new_generation(self) -> None:
+        prev_gen = self._current_generation
         prev_had_tool_calls = (
-            self._current_generation is not None
-            and self._current_generation._tool_calls_sent
+            prev_gen is not None
+            and prev_gen._tool_calls_sent
         )
 
         if self._current_generation and not self._current_generation._done:
@@ -1190,7 +1191,16 @@ class RealtimeSession(llm.RealtimeSession):
             self._pending_generation_fut.set_result(generation_event)
             self._pending_generation_fut = None
         elif not prev_had_tool_calls:
-            self._handle_input_speech_started()
+            logger.info(
+                "suppressed input_speech_started for model multi-turn "
+                "(no prior tool calls, no pending generate_reply). "
+                "User interruptions handled by server 'interrupted' signal.",
+                extra={
+                    "new_gen_id": self._current_generation.response_id,
+                    "prev_gen_id": prev_gen.response_id if prev_gen else None,
+                    "prev_gen_done": prev_gen._done if prev_gen else None,
+                },
+            )
 
         self.emit("generation_created", generation_event)
 
