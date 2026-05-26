@@ -8,7 +8,7 @@ import time
 import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import google.auth.credentials
 from google.auth._default_async import default_async
@@ -981,9 +981,40 @@ class RealtimeSession(llm.RealtimeSession):
                         types.LiveClientRealtimeInput,
                     ),
                 ):
-                    if not isinstance(msg, types.LiveClientRealtimeInput) or not (
+                    # ANECDOTE: log audio/video/text inputs as metadata-only
+                    # records (size + mime_type + flags) — the full body would
+                    # spam logs with per-frame base64 audio, but the TIMING +
+                    # COUNT of every outgoing frame is essential for debugging
+                    # phantom-interrupt root causes (we need to know exactly
+                    # what we sent to Gemini before its server VAD fires).
+                    if isinstance(msg, types.LiveClientRealtimeInput) and (
                         msg.audio or msg.video or msg.text
                     ):
+                        meta: dict[str, Any] = {}
+                        if msg.audio:
+                            meta["kind"] = "audio"
+                            meta["bytes"] = (
+                                len(msg.audio.data) if msg.audio.data else 0
+                            )
+                            meta["mime_type"] = msg.audio.mime_type
+                        elif msg.video:
+                            meta["kind"] = "video"
+                            meta["bytes"] = (
+                                len(msg.video.data) if msg.video.data else 0
+                            )
+                            meta["mime_type"] = msg.video.mime_type
+                        elif msg.text:
+                            meta["kind"] = "text"
+                            meta["text"] = msg.text[:160]
+                        if msg.activity_start is not None:
+                            meta["activity_start"] = True
+                        if msg.activity_end is not None:
+                            meta["activity_end"] = True
+                        logger.debug(
+                            ">>> sent LiveClientRealtimeInput",
+                            extra={"content": meta},
+                        )
+                    else:
                         logger.debug(
                             f">>> sent {type(msg).__name__}",
                             extra={"content": msg.model_dump(exclude_defaults=True)},
