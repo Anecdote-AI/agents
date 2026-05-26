@@ -1260,8 +1260,26 @@ class RealtimeSession(llm.RealtimeSession):
             current_gen._completed_timestamp = time.time()
 
         if server_content.interrupted and not self._pending_generation_fut:
-            # interrupt agent if there is no pending user initiated generation
-            self._handle_input_speech_started()
+            # ANECDOTE: do NOT fire _handle_input_speech_started() here.
+            # Gemini Live emits frequent false-positive `interrupted=true`
+            # mid-utterance (server-side VAD trigger-happy on agent's own
+            # audio frames + framing noise) — even with HIGH/HIGH sensitivity
+            # mirroring agents/supervisor/agent-server/. The standalone
+            # supervisor (gemini_session.py:560) treats this signal as a turn-
+            # end marker only (drain audio queue at turn boundary), NOT as an
+            # immediate "user is talking" trigger. The aggressive immediate-
+            # cut path here is what caused the perceived "agent interrupts
+            # itself" — buffered audio gets dropped mid-word and a recovery-
+            # filler generation kicks in. Real user barge-in is detected by
+            # the AgentSession's silero VAD on the room's user input track
+            # (see agents/generic_agent/agent.py — vad=silero.VAD.load()),
+            # which fires through a separate code path; suppressing this
+            # mirror signal does not break barge-in.
+            logger.info(
+                "suppressed input_speech_started from server interrupted "
+                "(Gemini false-positive VAD during agent utterance — barge-in "
+                "still handled by AgentSession's external VAD)",
+            )
 
         if server_content.turn_complete:
             self._mark_current_generation_done()
