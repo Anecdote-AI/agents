@@ -598,6 +598,7 @@ class RealtimeSession(llm.RealtimeSession):
             self._mark_restart_needed()
 
     async def update_instructions(self, instructions: str) -> None:
+        self._fw("update_instructions", chars=len(instructions))
         if not is_given(self._opts.instructions) or self._opts.instructions != instructions:
             self._opts.instructions = instructions
 
@@ -627,6 +628,7 @@ class RealtimeSession(llm.RealtimeSession):
             )
 
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
+        self._fw("update_chat_ctx", items=len(chat_ctx.items))
         # Check for system/developer messages that will be dropped
         system_msg_count = sum(
             1 for msg in chat_ctx.messages() if msg.role in ("system", "developer")
@@ -684,6 +686,7 @@ class RealtimeSession(llm.RealtimeSession):
         self._chat_ctx = chat_ctx
 
     async def update_tools(self, tools: list[llm.Tool]) -> None:
+        self._fw("update_tools", n=len(tools))
         tool_ctx = llm.ToolContext(tools)
         if self._tools == tool_ctx:
             return
@@ -768,7 +771,55 @@ class RealtimeSession(llm.RealtimeSession):
         )
         self._send_client_event(realtime_input)
 
+    def _fw(self, event: str, **detail: object) -> None:
+        """ANECDOTE-DEBUG: unified framework-action timeline marker.
+
+        Logs every framework→session action (and audio-stream gaps) so the exact
+        sequence the LiveKit framework drives can be diffed against a bare
+        google-genai client that does NOT reproduce the phantom-interrupt bug.
+        """
+        try:
+            logger.info("FW_EVENT|%s|%s", event, json.dumps(detail, default=str)[:400])
+        except Exception:
+            pass
+
     def _send_client_event(self, event: ClientEvents) -> None:
+        # ANECDOTE-DEBUG: timeline every outbound client event. Audio is logged
+        # only as GAPS (a stall + resume in the input stream can look like
+        # speech onset to Gemini's VAD → phantom interrupt); all non-audio
+        # events (content / tool_response / activity_start|end / text) are
+        # logged in full, since those are exactly what a bare client would NOT
+        # send.
+        try:
+            is_audio = isinstance(event, types.LiveClientRealtimeInput) and bool(event.audio)
+            if is_audio:
+                now = time.monotonic()
+                last = getattr(self, "_dbg_last_audio_send", None)
+                if last is not None and (now - last) * 1000 > 60:
+                    self._fw("audio_gap", gap_ms=round((now - last) * 1000, 1))
+                self._dbg_last_audio_send = now
+            elif isinstance(event, types.LiveClientRealtimeInput):
+                sub = (
+                    "activity_start" if event.activity_start
+                    else "activity_end" if event.activity_end
+                    else "text" if event.text
+                    else "video" if event.video
+                    else "?"
+                )
+                self._fw("send_RealtimeInput", sub=sub)
+            elif isinstance(event, types.LiveClientContent):
+                self._fw(
+                    "send_Content",
+                    turn_complete=event.turn_complete,
+                    roles=[getattr(t, "role", None) for t in (event.turns or [])],
+                )
+            elif isinstance(event, types.LiveClientToolResponse):
+                self._fw(
+                    "send_ToolResponse",
+                    fns=[getattr(fr, "name", None) for fr in (event.function_responses or [])],
+                )
+        except Exception:
+            pass
         with contextlib.suppress(utils.aio.channel.ChanClosed):
             self._msg_ch.send_nowait(event)
 
@@ -779,6 +830,7 @@ class RealtimeSession(llm.RealtimeSession):
         tool_choice: NotGivenOr[llm.ToolChoice] = NOT_GIVEN,
         tools: NotGivenOr[list[llm.Tool]] = NOT_GIVEN,
     ) -> asyncio.Future[llm.GenerationCreatedEvent]:
+        self._fw("generate_reply", instructions=is_given(instructions))
         if is_given(tools):
             logger.warning("per-response tools is not supported by Google Realtime API, ignoring")
         if not self._realtime_model.capabilities.mutable_chat_context:
@@ -845,6 +897,7 @@ class RealtimeSession(llm.RealtimeSession):
         return fut
 
     def start_user_activity(self) -> None:
+        self._fw("start_user_activity", manual=self._manual_activity_detection)
         if not self._manual_activity_detection:
             return
 
@@ -857,6 +910,7 @@ class RealtimeSession(llm.RealtimeSession):
             )
 
     def interrupt(self) -> None:
+        self._fw("interrupt")
         # Gemini Live treats activity start as interruption, so we rely on start_user_activity
         # notifications to handle it
         if (
@@ -916,6 +970,13 @@ class RealtimeSession(llm.RealtimeSession):
                     model=self._opts.model, config=config
                 ) as session:
                     self._report_connection_acquired(time.perf_counter() - t0)
+                    self._fw(
+                        "session_connected",
+                        retries=self._num_retries,
+                        resume_handle=self._session_resumption_handle[:8]
+                        if self._session_resumption_handle
+                        else None,
+                    )
                     async with self._session_lock:
                         self._active_session = session
 
@@ -1134,6 +1195,13 @@ class RealtimeSession(llm.RealtimeSession):
 
                     if not self._current_generation or self._current_generation._done or self._current_generation._tool_calls_sent:
                         if (sc := response.server_content) and sc.interrupted:
+                            self._fw(
+                                "server_interrupted_recv",
+                                cur_gen=getattr(self._current_generation, "response_id", None),
+                                cur_done=getattr(self._current_generation, "_done", None),
+                                tool_calls_sent=getattr(self._current_generation, "_tool_calls_sent", None),
+                                pending_generate_reply=self._pending_generation_fut is not None,
+                            )
                             # two cases an interrupted event is sent without an active generation
                             # 1) the generation is done but playout is not finished (turn_complete -> interrupted)
                             # 2) the generation is not started (interrupted -> turn_complete)
@@ -1178,6 +1246,7 @@ class RealtimeSession(llm.RealtimeSession):
                     if response.usage_metadata:
                         self._handle_usage_metadata(response.usage_metadata)
                     if response.go_away:
+                        self._fw("go_away_recv")
                         self._handle_go_away(response.go_away)
 
                     if self._num_retries > 0:
@@ -1296,6 +1365,14 @@ class RealtimeSession(llm.RealtimeSession):
         prev_had_tool_calls = (
             prev_gen is not None
             and prev_gen._tool_calls_sent
+        )
+        self._fw(
+            "start_new_generation",
+            prev_gen=getattr(prev_gen, "response_id", None),
+            prev_done=getattr(prev_gen, "_done", None),
+            prev_had_tool_calls=prev_had_tool_calls,
+            pending_generate_reply=self._pending_generation_fut is not None
+            and not self._pending_generation_fut.done(),
         )
 
         if self._current_generation and not self._current_generation._done:
@@ -1481,6 +1558,12 @@ class RealtimeSession(llm.RealtimeSession):
             gen.message_ch.close()
 
     def _mark_current_generation_done(self) -> None:
+        if self._current_generation and not self._current_generation._done:
+            self._fw(
+                "mark_generation_done",
+                gen_id=self._current_generation.response_id,
+                tool_calls_sent=self._current_generation._tool_calls_sent,
+            )
         if not self._current_generation or self._current_generation._done:
             return
 
@@ -1490,6 +1573,7 @@ class RealtimeSession(llm.RealtimeSession):
             logger.debug(f"generation done {self._current_generation}")
 
     def _handle_input_speech_started(self) -> None:
+        self._fw("input_speech_started_emit")
         self.emit("input_speech_started", llm.InputSpeechStartedEvent())
 
     def _handle_input_speech_stopped(self) -> None:
