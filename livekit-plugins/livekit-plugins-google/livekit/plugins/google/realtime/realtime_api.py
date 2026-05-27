@@ -1194,14 +1194,13 @@ class RealtimeSession(llm.RealtimeSession):
                 dump["system_instruction"] = f"<{len(_txt)} chars>"
             if isinstance(dump.get("tools"), list):
                 _names: list[str] = []
-                for t in (self._tools or []):
-                    _nm = getattr(t, "name", None) or (
-                        t.get("name") if isinstance(t, dict) else None
-                    )
-                    if _nm:
-                        _names.append(_nm)
+                for _t in dump["tools"]:
+                    if isinstance(_t, dict):
+                        for _fd in (_t.get("function_declarations") or []):
+                            if isinstance(_fd, dict) and _fd.get("name"):
+                                _names.append(_fd["name"])
                 dump["tools"] = {
-                    "count": len(dump["tools"]),
+                    "count": len(_names),
                     "tool_behavior": str(self._opts.tool_behavior),
                     "names": _names,
                 }
