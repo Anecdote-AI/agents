@@ -451,11 +451,18 @@ class RealtimeSession(llm.RealtimeSession):
         self._msg_ch = utils.aio.Chan[ClientEvents]()
         self._input_resampler: rtc.AudioResampler | None = None
 
-        # 50ms chunks
+        # ANECDOTE: send 10ms input chunks (160 samples @ 16kHz), matching the
+        # standalone supervisor's native cadence. The upstream default of 50ms
+        # (// 20 = 800 samples) is 5x coarser than the standalone and larger
+        # than Gemini's `prefix_padding_ms=20` server-VAD window, which
+        # destabilises automatic activity detection and produces false-positive
+        # `interrupted=true` events ("framing noise"). 10ms (// 100) aligns with
+        # the 20ms padding / 200ms silence VAD timing and eliminates the phantom
+        # interrupts the standalone never sees.
         self._bstream = audio_utils.AudioByteStream(
             INPUT_AUDIO_SAMPLE_RATE,
             INPUT_AUDIO_CHANNELS,
-            samples_per_channel=INPUT_AUDIO_SAMPLE_RATE // 20,
+            samples_per_channel=INPUT_AUDIO_SAMPLE_RATE // 100,
         )
 
         api_version = self._opts.api_version
@@ -1169,6 +1176,38 @@ class RealtimeSession(llm.RealtimeSession):
             conf.realtime_input_config = self._opts.realtime_input_config
         if is_given(self._opts.context_window_compression):
             conf.context_window_compression = self._opts.context_window_compression
+
+        # ANECDOTE: dump the exact LiveConnectConfig (setup) we send to Gemini
+        # so the session config is visible in logs rather than reconstructed
+        # from code. system_instruction text and tool param schemas are
+        # summarised (length / names+behavior) to keep the line readable; every
+        # behaviour-relevant field (modalities, generation_config, speech_config,
+        # realtime_input_config/VAD, transcription, history/session/compression)
+        # is logged verbatim.
+        try:
+            dump = conf.model_dump(exclude_none=True, mode="json")
+            if isinstance(dump.get("system_instruction"), dict):
+                _si = conf.system_instruction
+                _txt = ""
+                if _si and getattr(_si, "parts", None):
+                    _txt = "".join((p.text or "") for p in _si.parts)
+                dump["system_instruction"] = f"<{len(_txt)} chars>"
+            if isinstance(dump.get("tools"), list):
+                _names: list[str] = []
+                for t in (self._tools or []):
+                    _nm = getattr(t, "name", None) or (
+                        t.get("name") if isinstance(t, dict) else None
+                    )
+                    if _nm:
+                        _names.append(_nm)
+                dump["tools"] = {
+                    "count": len(dump["tools"]),
+                    "tool_behavior": str(self._opts.tool_behavior),
+                    "names": _names,
+                }
+            logger.info("GEMINI_LIVE_SETUP_CONFIG %s", json.dumps(dump, default=str))
+        except Exception:
+            logger.exception("failed to log GEMINI_LIVE_SETUP_CONFIG")
 
         return conf
 
