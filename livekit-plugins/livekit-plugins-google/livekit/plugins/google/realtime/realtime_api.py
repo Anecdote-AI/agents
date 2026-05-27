@@ -399,6 +399,20 @@ class RealtimeModel(llm.RealtimeModel):
         else:
             return "Gemini"
 
+    @property
+    def _anecdote_blocking_tools(self) -> bool:
+        """True when realtime function calls are synchronous (BLOCKING).
+
+        Supervisor agents omit ``tool_behavior`` (→ NOT_GIVEN → Gemini blocks
+        after toolCall until it receives the FunctionResponse); non-supervisor
+        agents set ``NON_BLOCKING``. AgentActivity reads this to deliver the
+        tool result immediately for BLOCKING tools — without waiting for an
+        in-flight continuation/filler generation to drain — matching the
+        standalone supervisor and avoiding the phantom-VAD tool-call
+        cancellation that the wait otherwise allows.
+        """
+        return not is_given(self._opts.tool_behavior)
+
     def session(self) -> RealtimeSession:
         sess = RealtimeSession(self)
         self._sessions.add(sess)

@@ -3540,10 +3540,29 @@ class AgentActivity(RecognitionHooks):
                 # speech is active or queued we still wait, so non-supervisor /
                 # NON_BLOCKING realtime agents are unaffected (their issuing turn
                 # is already `.done()` by this point).
-                while self._speech_q or (
-                    self._current_speech is not None
-                    and self._current_speech is not speech_handle
-                    and not self._current_speech.done()
+                # ANECDOTE PATCH 2: synchronous (BLOCKING) supervisor tools must
+                # deliver the result IMMEDIATELY, with no generation wait —
+                # exactly like the standalone supervisor's send_tool_response.
+                # The wait below otherwise keeps a continuation/filler generation
+                # (the audio Gemini streams right after the toolCall) open for
+                # several seconds while the result is held back; Gemini's
+                # HIGH-sensitivity VAD then fires a phantom `interrupted` that
+                # cancels the still-pending tool call, so the result lands on a
+                # dead call id and the model re-asks (time-buying-phrase loop).
+                # PATCH 1 above excluded only the tool-ISSUING turn; the
+                # continuation generation is a *different* speech_handle, so the
+                # loop still waited on it. `_anecdote_blocking_tools` is True only
+                # for supervisor realtime agents (tool_behavior omitted); it is
+                # absent/False for every other agent and provider, so their
+                # behavior is unchanged.
+                _blocking_tools = getattr(self.llm, "_anecdote_blocking_tools", False)
+                while not _blocking_tools and (
+                    self._speech_q
+                    or (
+                        self._current_speech is not None
+                        and self._current_speech is not speech_handle
+                        and not self._current_speech.done()
+                    )
                 ):
                     if (
                         self._current_speech
