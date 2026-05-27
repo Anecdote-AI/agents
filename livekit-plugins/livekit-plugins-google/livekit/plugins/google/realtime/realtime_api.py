@@ -467,6 +467,17 @@ class RealtimeSession(llm.RealtimeSession):
         self._msg_ch = utils.aio.Chan[ClientEvents]()
         self._input_resampler: rtc.AudioResampler | None = None
 
+        # ANECDOTE: pace outbound audio to a steady real-time cadence (one 10ms
+        # frame per ~10ms) instead of sending the bstream's frames in bursts.
+        # push_audio emits 2+ 10ms frames back-to-back per room frame and they
+        # are flushed as a burst (median 1.1ms apart, p90 20.7ms) — the
+        # standalone supervisor streams a steady 10ms cadence and never sees
+        # the phantom `interrupted` that bursty delivery trips in Gemini's
+        # server-side VAD. Gated to synchronous (BLOCKING) supervisor agents
+        # (tool_behavior omitted); other agents/providers are unaffected.
+        self._pace_outbound_audio = not is_given(self._opts.tool_behavior)
+        self._next_audio_send_at = 0.0
+
         # ANECDOTE: send 10ms input chunks (160 samples @ 16kHz), matching the
         # standalone supervisor's native cadence. The upstream default of 50ms
         # (// 20 = 800 samples) is 5x coarser than the standalone and larger
@@ -1019,6 +1030,18 @@ class RealtimeSession(llm.RealtimeSession):
                     await session.send_tool_response(function_responses=msg.function_responses)
                 elif isinstance(msg, types.LiveClientRealtimeInput):
                     if msg.audio:
+                        # ANECDOTE: real-time pace (smooth bursts → steady 10ms),
+                        # see __init__. Each frame carries len/2 samples @ 16kHz;
+                        # average rate == real-time so this adds no net backlog,
+                        # only delays burst frames (≤ one frame duration).
+                        if self._pace_outbound_audio and msg.audio.data:
+                            now = time.monotonic()
+                            frame_dur = (len(msg.audio.data) / 2) / INPUT_AUDIO_SAMPLE_RATE
+                            if now >= self._next_audio_send_at:
+                                self._next_audio_send_at = now + frame_dur
+                            else:
+                                await asyncio.sleep(self._next_audio_send_at - now)
+                                self._next_audio_send_at += frame_dur
                         await session.send_realtime_input(audio=msg.audio)
                     elif msg.video:
                         await session.send_realtime_input(video=msg.video)
