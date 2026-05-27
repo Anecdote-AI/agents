@@ -3524,7 +3524,27 @@ class AgentActivity(RecognitionHooks):
             if len(new_fnc_outputs) > 0:
                 # wait all speeches played before updating the tool output and generating the response
                 # most realtime models don't support generating multiple responses at the same time
-                while self._current_speech or self._speech_q:
+                #
+                # ANECDOTE PATCH: only wait for speeches OTHER than the turn that
+                # issued this tool call. The original condition
+                # (`while self._current_speech or self._speech_q`) also waited on
+                # `speech_handle` itself, which DEADLOCKS with synchronous
+                # (BLOCKING) realtime function calls: the issuing turn cannot
+                # complete until the tool result below is delivered to the model,
+                # but the result is held back until the turn completes — Gemini
+                # then fires `tool_call_cancellation` ~12 s later. By excluding
+                # `speech_handle` from the wait we deliver the result while the
+                # issuing turn is still open, exactly as the standalone supervisor
+                # does. This only changes behavior in the deadlock case (current
+                # speech IS the issuing turn and is not done); when a *different*
+                # speech is active or queued we still wait, so non-supervisor /
+                # NON_BLOCKING realtime agents are unaffected (their issuing turn
+                # is already `.done()` by this point).
+                while self._speech_q or (
+                    self._current_speech is not None
+                    and self._current_speech is not speech_handle
+                    and not self._current_speech.done()
+                ):
                     if (
                         self._current_speech
                         and not self._current_speech.done()
