@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import array
 import asyncio
 import contextlib
 import json
+import math
 import os
 import time
 import weakref
@@ -689,13 +691,48 @@ class RealtimeSession(llm.RealtimeSession):
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         for f in self._resample_audio(frame):
             for nf in self._bstream.write(f.data.tobytes()):
+                pcm = nf.data.tobytes()
                 realtime_input = types.LiveClientRealtimeInput(
                     audio=types.Blob(
-                        data=nf.data.tobytes(),
+                        data=pcm,
                         mime_type=f"audio/pcm;rate={INPUT_AUDIO_SAMPLE_RATE}",
                     )
                 )
                 self._send_client_event(realtime_input)
+                # ANECDOTE-DEBUG: windowed input-audio energy stats — see whether
+                # the audio we stream to Gemini during a tool-wait is truly silent
+                # (phantom-VAD hypothesis) or carries low-level energy.
+                try:
+                    self._dbg_audio_stat(pcm)
+                except Exception:
+                    pass
+
+    def _dbg_audio_stat(self, pcm: bytes) -> None:
+        st = getattr(self, "_dbg_audio", None)
+        if st is None:
+            st = {"frames": 0, "samples": 0, "sumsq": 0.0, "peak": 0, "t0": time.monotonic()}
+            self._dbg_audio = st
+        samples = array.array("h")
+        samples.frombytes(pcm)
+        if samples:
+            st["frames"] += 1
+            st["samples"] += len(samples)
+            st["sumsq"] += float(sum(s * s for s in samples))
+            st["peak"] = max(st["peak"], max(abs(s) for s in samples))
+        now = time.monotonic()
+        if now - st["t0"] >= 1.0 and st["samples"]:
+            rms = math.sqrt(st["sumsq"] / st["samples"])
+            rms_db = 20.0 * math.log10(rms / 32768.0) if rms > 0 else -120.0
+            peak_db = 20.0 * math.log10(st["peak"] / 32768.0) if st["peak"] > 0 else -120.0
+            logger.info(
+                "AUDIO_IN_STATS window_s=%.2f frames=%d rms_dbfs=%.1f peak_dbfs=%.1f peak_abs=%d",
+                now - st["t0"], st["frames"], rms_db, peak_db, st["peak"],
+            )
+            st["frames"] = 0
+            st["samples"] = 0
+            st["sumsq"] = 0.0
+            st["peak"] = 0
+            st["t0"] = now
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
         encoded_data = images.encode(
@@ -1205,6 +1242,13 @@ class RealtimeSession(llm.RealtimeSession):
                     "names": _names,
                 }
             logger.info("GEMINI_LIVE_SETUP_CONFIG %s", json.dumps(dump, default=str))
+            # ANECDOTE-DEBUG: full, UN-summarised setup for byte-level diffing
+            # against the standalone supervisor (full system_instruction + every
+            # tool's FunctionDeclaration incl. per-function `behavior`).
+            logger.info(
+                "GEMINI_LIVE_SETUP_CONFIG_FULL %s",
+                json.dumps(conf.model_dump(exclude_none=True, mode="json"), default=str),
+            )
         except Exception:
             logger.exception("failed to log GEMINI_LIVE_SETUP_CONFIG")
 
