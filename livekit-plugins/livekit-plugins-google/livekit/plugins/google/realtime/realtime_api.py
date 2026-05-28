@@ -467,11 +467,25 @@ class RealtimeSession(llm.RealtimeSession):
         self._msg_ch = utils.aio.Chan[ClientEvents]()
         self._input_resampler: rtc.AudioResampler | None = None
 
-        # 50ms chunks
+        # Pace outbound audio to a steady ~10 ms cadence in _send_task. push_audio
+        # emits bstream frames in bursts (2+ back-to-back per room frame, median
+        # 1.1 ms apart, p90 20.7 ms) — Gemini's server-VAD reads the gap-between-
+        # bursts as dead silence (peak_abs=1-2) and trips a phantom
+        # `interrupted=true`, which cuts the agent mid-utterance. Gated to
+        # synchronous (BLOCKING) supervisor agents (tool_behavior omitted);
+        # other agents/providers are unaffected.
+        self._pace_outbound_audio = not is_given(self._opts.tool_behavior)
+        self._next_audio_send_at = 0.0
+
+        # 10 ms input chunks (160 samples @ 16 kHz). The upstream default of
+        # 50 ms (// 20) is 5x coarser than the standalone supervisor's native
+        # cadence and larger than Gemini's prefix_padding_ms=20 server-VAD
+        # window, which destabilises automatic activity detection and produces
+        # false-positive `interrupted=true` events ("framing noise").
         self._bstream = audio_utils.AudioByteStream(
             INPUT_AUDIO_SAMPLE_RATE,
             INPUT_AUDIO_CHANNELS,
-            samples_per_channel=INPUT_AUDIO_SAMPLE_RATE // 20,
+            samples_per_channel=INPUT_AUDIO_SAMPLE_RATE // 100,
         )
 
         api_version = self._opts.api_version
@@ -1072,6 +1086,22 @@ class RealtimeSession(llm.RealtimeSession):
                     await session.send_tool_response(function_responses=msg.function_responses)
                 elif isinstance(msg, types.LiveClientRealtimeInput):
                     if msg.audio:
+                        # Real-time pace audio frames to a steady cadence so
+                        # server-VAD doesn't see bursty bursts + silence gaps
+                        # (which it reads as the speaker stopping → phantom
+                        # interrupted). Each frame carries len/2 samples at
+                        # 16 kHz; spacing by the frame's own duration adds no
+                        # net backlog (average rate == real-time) and at most
+                        # ~one frame of latency on a burst. Control messages
+                        # (content / tool response / activity) are never paced.
+                        if self._pace_outbound_audio and msg.audio.data:
+                            now = time.monotonic()
+                            frame_dur = (len(msg.audio.data) / 2) / INPUT_AUDIO_SAMPLE_RATE
+                            if now >= self._next_audio_send_at:
+                                self._next_audio_send_at = now + frame_dur
+                            else:
+                                await asyncio.sleep(self._next_audio_send_at - now)
+                                self._next_audio_send_at += frame_dur
                         await session.send_realtime_input(audio=msg.audio)
                     elif msg.video:
                         await session.send_realtime_input(video=msg.video)
