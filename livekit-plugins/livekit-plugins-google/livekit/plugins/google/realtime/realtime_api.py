@@ -1417,17 +1417,28 @@ class RealtimeSession(llm.RealtimeSession):
             generation_event.user_initiated = True
             self._pending_generation_fut.set_result(generation_event)
             self._pending_generation_fut = None
-        elif not prev_had_tool_calls:
-            logger.info(
-                "suppressed input_speech_started for model multi-turn "
-                "(no prior tool calls, no pending generate_reply). "
-                "User interruptions handled by server 'interrupted' signal.",
-                extra={
-                    "new_gen_id": self._current_generation.response_id,
-                    "prev_gen_id": prev_gen.response_id if prev_gen else None,
-                    "prev_gen_done": prev_gen._done if prev_gen else None,
-                },
+        elif not prev_had_tool_calls and prev_gen is not None and prev_gen._done:
+            # ANECDOTE: a NEW generation with no prior tool calls + no pending
+            # generate_reply, started AFTER the previous turn completed, is a
+            # real user BARGE-IN (Gemini saw the user speak mid-playback and is
+            # responding). Fire `input_speech_started` so AgentSession stops
+            # the buffered audio.
+            #
+            # This branch USED to suppress the event because the same signature
+            # also matched a spontaneous duplicate-response generation; that
+            # duplicate's trigger — generic_agent's post-tool "What was the
+            # result?" text injection in `_on_function_tools_executed` — has
+            # since been gated off for supervisor agents, so the only remaining
+            # source of this code path is a real barge-in.
+            #
+            # `prev_gen is not None and prev_gen._done` excludes the initial
+            # greeting (no previous turn to interrupt).
+            self._fw(
+                "barge_in_fire_input_speech_started",
+                new_gen_id=self._current_generation.response_id,
+                prev_gen_id=prev_gen.response_id,
             )
+            self._handle_input_speech_started()
 
         self.emit("generation_created", generation_event)
 
