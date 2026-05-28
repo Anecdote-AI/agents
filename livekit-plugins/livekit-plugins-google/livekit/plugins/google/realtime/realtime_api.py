@@ -1498,26 +1498,36 @@ class RealtimeSession(llm.RealtimeSession):
             current_gen._completed_timestamp = time.time()
 
         if server_content.interrupted and not self._pending_generation_fut:
-            # ANECDOTE: do NOT fire _handle_input_speech_started() here.
-            # Gemini Live emits frequent false-positive `interrupted=true`
-            # mid-utterance (server-side VAD trigger-happy on agent's own
-            # audio frames + framing noise) — even with HIGH/HIGH sensitivity
-            # mirroring agents/supervisor/agent-server/. The standalone
-            # supervisor (gemini_session.py:560) treats this signal as a turn-
-            # end marker only (drain audio queue at turn boundary), NOT as an
-            # immediate "user is talking" trigger. The aggressive immediate-
-            # cut path here is what caused the perceived "agent interrupts
-            # itself" — buffered audio gets dropped mid-word and a recovery-
-            # filler generation kicks in. Real user barge-in is detected by
-            # the AgentSession's silero VAD on the room's user input track
-            # (see agents/generic_agent/agent.py — vad=silero.VAD.load()),
-            # which fires through a separate code path; suppressing this
-            # mirror signal does not break barge-in.
-            logger.info(
-                "suppressed input_speech_started from server interrupted "
-                "(Gemini false-positive VAD during agent utterance — barge-in "
-                "still handled by AgentSession's external VAD)",
+            # ANECDOTE: treat server `interrupted` as a real barge-in signal
+            # and fire `_handle_input_speech_started()` so AgentSession drains
+            # the buffered audio immediately — matching what the standalone
+            # supervisor does on the same signal.
+            #
+            # History: this branch used to *suppress* the call because
+            # `interrupted` was firing as a phantom (silent input) ~35 ms after
+            # `send_realtime_input(text=...)` text injections. The root cause
+            # was a post-tool "What was the result?" nudge in generic_agent's
+            # `_on_function_tools_executed`; with that nudge gated off for
+            # supervisor agents in the consuming repo (commit 6c4c477a), the
+            # phantoms are gone. Post-fix telemetry: `interrupted` events
+            # correlate with `AUDIO_IN_STATS` windows showing real user-speech
+            # energy (peak_abs ~25k), not silence (peak_abs ≤ 2). Suppressing
+            # the signal added ~3 s of barge-in latency: we had to wait for
+            # `_start_new_generation`'s `anecdote.11` fire (which only happens
+            # after Gemini finishes transcription and starts the next turn).
+            #
+            # The `not self._pending_generation_fut` guard ensures a
+            # deliberately-pending `generate_reply` isn't preempted.
+            # `_start_new_generation`'s barge-in fire remains a fallback for
+            # the rare case where Gemini starts a new generation without first
+            # emitting `interrupted`.
+            self._fw(
+                "barge_in_fire_input_speech_started_from_server_interrupt",
+                cur_gen=getattr(current_gen, "response_id", None),
+                cur_done=getattr(current_gen, "_done", None),
+                tool_calls_sent=getattr(current_gen, "_tool_calls_sent", None),
             )
+            self._handle_input_speech_started()
 
         if server_content.turn_complete:
             self._mark_current_generation_done()
