@@ -1156,7 +1156,11 @@ class RealtimeSession(llm.RealtimeSession):
                                     part["inline_data"] = "<audio>"
                         logger.debug("<<< received response", extra={"response": resp_copy})
 
-                    if not self._current_generation or self._current_generation._done:
+                    if (
+                        not self._current_generation
+                        or self._current_generation._done
+                        or self._current_generation._tool_calls_sent
+                    ):
                         if (sc := response.server_content) and sc.interrupted:
                             self._fw(
                                 "server_interrupted_recv",
@@ -1172,7 +1176,21 @@ class RealtimeSession(llm.RealtimeSession):
                             # 2) the generation is not started (interrupted -> turn_complete)
                             # for both cases, we interrupt the agent if there is no pending generation from `generate_reply`
                             # for the second case, the pending generation will be stopped by `turn_complete` event coming later
-                            if not self._pending_generation_fut:
+                            #
+                            # Additional case (ANECDOTE): when Gemini emits the
+                            # `interrupted=true` in the WINDOW between `tool_call`
+                            # (channels closed, `_tool_calls_sent=True`) and
+                            # `tool_response` delivery (still `_done=False`),
+                            # Gemini's server-VAD often trips on its own
+                            # continuation/filler audio rather than real user
+                            # speech. Suppress the input_speech_started fire in
+                            # that window so the buying-time phrase is not cut.
+                            is_tool_call_transition = (
+                                self._current_generation is not None
+                                and self._current_generation._tool_calls_sent
+                                and not self._current_generation._done
+                            )
+                            if not self._pending_generation_fut and not is_tool_call_transition:
                                 self._handle_input_speech_started()
 
                             sc.interrupted = None
