@@ -3713,9 +3713,28 @@ class AgentActivity(RecognitionHooks):
                 draining = True
 
             if len(new_fnc_outputs) > 0:
-                # wait all speeches played before updating the tool output and generating the response
-                # most realtime models don't support generating multiple responses at the same time
-                while self._current_speech or self._speech_q:
+                # Wait for in-flight speeches (other than the issuing one)
+                # before delivering the tool result. The issuing speech is
+                # excluded because for synchronous (BLOCKING) realtime tool
+                # calls it cannot complete until the result is sent — waiting
+                # on it deadlocks until Gemini fires tool_call_cancellation.
+                #
+                # For BLOCKING tools (`_clarity_blocking_tools=True`, signalled
+                # by the realtime model when tool_behavior is omitted) skip
+                # the wait entirely: any continuation/filler generation Gemini
+                # streams after the toolCall is a different speech_handle that
+                # would also block the result indefinitely on its own, again
+                # leading to a phantom interrupt → tool_call_cancellation.
+                # Other agents/providers (NON_BLOCKING) see no behaviour change.
+                _blocking_tools = getattr(self.llm, "_clarity_blocking_tools", False)
+                while not _blocking_tools and (
+                    self._speech_q
+                    or (
+                        self._current_speech is not None
+                        and self._current_speech is not speech_handle
+                        and not self._current_speech.done()
+                    )
+                ):
                     if (
                         self._current_speech
                         and not self._current_speech.done()
