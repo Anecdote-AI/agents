@@ -65,6 +65,7 @@ from openai.types.realtime import (
     RealtimeConversationItemFunctionCall,
     RealtimeErrorEvent,
     RealtimeFunctionTool,
+    RealtimeReasoning,
     RealtimeResponseCreateParams,
     RealtimeSessionCreateRequest,
     ResponseAudioDeltaEvent,
@@ -197,6 +198,8 @@ def _oai_session_to_azure(session: RealtimeSessionCreateRequest) -> AzureSession
         mapped["max_response_output_tokens"] = session.max_output_tokens
     if session.tracing is not None:
         mapped["tracing"] = session.tracing
+    if session.reasoning is not None:
+        mapped["reasoning"] = session.reasoning
 
     return AzureSession.model_construct(**mapped)
 
@@ -226,6 +229,7 @@ class _RealtimeOptions:
     max_response_output_tokens: int | Literal["inf"] | None
     tracing: Tracing | None
     truncation: RealtimeTruncation | None
+    reasoning: RealtimeReasoning | None
     api_key: str | None
     base_url: str
     is_azure: bool
@@ -261,6 +265,15 @@ class _ResponseGeneration:
     _first_token_timestamp: float | None = None
     """timestamp when the first token was received"""
 
+    def _close(self) -> None:
+        for msg in self.messages.values():
+            if not msg.text_ch.closed:
+                msg.text_ch.close()
+            if not msg.audio_ch.closed:
+                msg.audio_ch.close()
+        self.function_ch.close()
+        self.message_ch.close()
+
 
 class RealtimeModel(llm.RealtimeModel):
     @overload
@@ -283,6 +296,7 @@ class RealtimeModel(llm.RealtimeModel):
         speed: NotGivenOr[float] = NOT_GIVEN,
         tracing: NotGivenOr[Tracing | None] = NOT_GIVEN,
         truncation: NotGivenOr[RealtimeTruncation | None] = NOT_GIVEN,
+        reasoning: NotGivenOr[RealtimeReasoning | None] = NOT_GIVEN,
         api_key: str | None = None,
         base_url: NotGivenOr[str] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
@@ -315,6 +329,7 @@ class RealtimeModel(llm.RealtimeModel):
         speed: NotGivenOr[float] = NOT_GIVEN,
         tracing: NotGivenOr[Tracing | None] = NOT_GIVEN,
         truncation: NotGivenOr[RealtimeTruncation | None] = NOT_GIVEN,
+        reasoning: NotGivenOr[RealtimeReasoning | None] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
         max_session_duration: NotGivenOr[float | None] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
@@ -341,6 +356,7 @@ class RealtimeModel(llm.RealtimeModel):
         speed: NotGivenOr[float] = NOT_GIVEN,
         tracing: NotGivenOr[Tracing | None] = NOT_GIVEN,
         truncation: NotGivenOr[RealtimeTruncation | None] = NOT_GIVEN,
+        reasoning: NotGivenOr[RealtimeReasoning | None] = NOT_GIVEN,
         api_key: str | None = None,
         http_session: aiohttp.ClientSession | None = None,
         azure_deployment: str | None = None,
@@ -365,6 +381,7 @@ class RealtimeModel(llm.RealtimeModel):
             speed (float | NotGiven): Audio playback speed multiplier.
             tracing (Tracing | None | NotGiven): Tracing configuration for OpenAI Realtime.
             truncation (RealtimeTruncation | None | NotGiven): Truncation configuration for OpenAI Realtime.
+            reasoning (RealtimeReasoning | None | NotGiven): Reasoning config for reasoning-capable models (e.g. ``gpt-realtime-2``), e.g. ``RealtimeReasoning(effort="low")``.
             api_key (str | None): OpenAI API key. If None and not using Azure, read from OPENAI_API_KEY.
             http_session (aiohttp.ClientSession | None): Optional shared HTTP session.
             azure_deployment (str | None): Azure deployment name. Presence of any Azure-specific option enables Azure mode.
@@ -450,7 +467,7 @@ class RealtimeModel(llm.RealtimeModel):
                     )
                 base_url_val = f"{azure_endpoint.rstrip('/')}/openai"
             else:
-                base_url_val = OPENAI_BASE_URL
+                base_url_val = os.getenv("OPENAI_BASE_URL", OPENAI_BASE_URL)
 
         self._opts = _RealtimeOptions(
             model=model,
@@ -470,6 +487,7 @@ class RealtimeModel(llm.RealtimeModel):
             speed=speed if is_given(speed) else 1.0,
             tracing=tracing if is_given(tracing) else None,
             truncation=truncation if is_given(truncation) else None,
+            reasoning=reasoning if is_given(reasoning) else None,
             max_session_duration=max_session_duration
             if is_given(max_session_duration)
             else DEFAULT_MAX_SESSION_DURATION,
@@ -510,6 +528,7 @@ class RealtimeModel(llm.RealtimeModel):
         ] = NOT_GIVEN,
         speed: NotGivenOr[float] = NOT_GIVEN,
         tracing: NotGivenOr[Tracing | None] = NOT_GIVEN,
+        reasoning: NotGivenOr[RealtimeReasoning | None] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
         max_session_duration: NotGivenOr[float | None] = NOT_GIVEN,
         temperature: NotGivenOr[float] = NOT_GIVEN,  # deprecated, unused in v1
@@ -531,6 +550,7 @@ class RealtimeModel(llm.RealtimeModel):
             turn_detection (RealtimeAudioInputTurnDetection | TurnDetection | None | NotGiven): Server-side VAD; defaults to Azure-optimized values when not provided.
             speed (float | NotGiven): Audio playback speed multiplier.
             tracing (Tracing | None | NotGiven): Tracing configuration for OpenAI Realtime.
+            reasoning (RealtimeReasoning | None | NotGiven): Reasoning config for reasoning-capable models, e.g. ``RealtimeReasoning(effort="low")``.
             http_session (aiohttp.ClientSession | None): Optional shared HTTP session.
             max_session_duration (float | None | NotGiven): Seconds before recycling the connection.
             temperature (float | NotGiven): Deprecated; ignored by Realtime v1.
@@ -638,6 +658,7 @@ class RealtimeModel(llm.RealtimeModel):
             turn_detection=turn_detection,
             speed=speed,
             tracing=tracing,
+            reasoning=reasoning,
             api_key=api_key,
             http_session=http_session,
             azure_deployment=azure_deployment,
@@ -665,6 +686,7 @@ class RealtimeModel(llm.RealtimeModel):
         speed: NotGivenOr[float] = NOT_GIVEN,
         tracing: NotGivenOr[Tracing | None] = NOT_GIVEN,
         truncation: NotGivenOr[RealtimeTruncation | None] = NOT_GIVEN,
+        reasoning: NotGivenOr[RealtimeReasoning | None] = NOT_GIVEN,
         temperature: NotGivenOr[float] = NOT_GIVEN,  # deprecated, unused in v1
     ) -> None:
         if is_given(voice):
@@ -694,6 +716,9 @@ class RealtimeModel(llm.RealtimeModel):
         if is_given(truncation):
             self._opts.truncation = truncation
 
+        if is_given(reasoning):
+            self._opts.reasoning = reasoning
+
         for sess in self._sessions:
             sess.update_options(
                 voice=voice,
@@ -705,6 +730,7 @@ class RealtimeModel(llm.RealtimeModel):
                 speed=speed,
                 tracing=tracing,
                 truncation=truncation,
+                reasoning=reasoning,
             )
 
     def _ensure_http_session(self) -> aiohttp.ClientSession:
@@ -1189,6 +1215,8 @@ class RealtimeSession(
             session.instructions = self._instructions
         if opts.truncation is not None:
             session.truncation = opts.truncation
+        if opts.reasoning is not None:
+            session.reasoning = opts.reasoning
 
         return self._wrap_session_update(
             event_id=utils.shortuuid("session_update_"), session=session
@@ -1216,6 +1244,7 @@ class RealtimeSession(
         speed: NotGivenOr[float] = NOT_GIVEN,
         tracing: NotGivenOr[Tracing | None] = NOT_GIVEN,
         truncation: NotGivenOr[RealtimeTruncation | None] = NOT_GIVEN,
+        reasoning: NotGivenOr[RealtimeReasoning | None] = NOT_GIVEN,
     ) -> None:
         session = RealtimeSessionCreateRequest(type="realtime")
         has_changes = False
@@ -1245,6 +1274,13 @@ class RealtimeSession(
                 session.truncation = truncation
                 has_changes = True
             self._opts.truncation = truncation
+
+        if is_given(reasoning):
+            if self._opts.reasoning != reasoning:
+                # setting reasoning to None clears it server-side
+                session.reasoning = reasoning
+                has_changes = True
+            self._opts.reasoning = reasoning
 
         has_audio_config = False
         audio_output = RealtimeAudioConfigOutput()
@@ -1334,6 +1370,20 @@ class RealtimeSession(
     ) -> list[ConversationItemCreateEvent | ConversationItemDeleteEvent]:
         events: list[ConversationItemCreateEvent | ConversationItemDeleteEvent] = []
         remote_ctx = self._remote_chat_ctx.to_chat_ctx()
+
+        # Empty message content can mean either:
+        # - a local placeholder that should not be created remotely, or
+        # - an existing remote item with non-text content (audio/images) that is not
+        #   synced into the agent-side ChatContext.
+        # Keep empty messages that already exist remotely so we do not delete them.
+        remote_ids = {item.id for item in remote_ctx.items}
+        chat_ctx = llm.ChatContext(
+            [
+                item
+                for item in chat_ctx.items
+                if item.type != "message" or item.content or item.id in remote_ids
+            ]
+        )
         diff_ops = llm.utils.compute_chat_ctx_diff(remote_ctx, chat_ctx)
 
         def _delete_item(msg_id: str) -> None:
@@ -1929,24 +1979,29 @@ class RealtimeSession(
         first_token_timestamp = self._current_generation._first_token_timestamp
 
         for generation in self._current_generation.messages.values():
-            # close all messages that haven't been closed yet
-            if not generation.text_ch.closed:
-                generation.text_ch.close()
-            if not generation.audio_ch.closed:
-                generation.audio_ch.close()
             if not generation.modalities.done():
                 generation.modalities.set_result(self._opts.modalities)
 
-        self._current_generation.function_ch.close()
-        self._current_generation.message_ch.close()
         for item_id, item_generation in self._current_generation.messages.items():
             if (remote_item := self._remote_chat_ctx.get(item_id)) and isinstance(
                 remote_item.item, llm.ChatMessage
             ):
                 remote_item.item.content.append(item_generation.audio_transcript)
 
+        self._current_generation._close()
+
         with contextlib.suppress(asyncio.InvalidStateError):
-            self._current_generation._done_fut.set_result(None)
+            if event.response.status in ("failed", "incomplete"):
+                details = event.response.status_details
+                msg = f"response {event.response.status}"
+                if details and details.error:
+                    msg = f"{msg}: [{details.error.type}] {details.error.code}"
+                elif details and details.reason:
+                    msg = f"{msg}: {details.reason}"
+                self._current_generation._done_fut.set_exception(llm.RealtimeError(msg))
+            else:
+                self._current_generation._done_fut.set_result(None)
+
         self._current_generation = None
 
         # calculate metrics
@@ -2027,8 +2082,12 @@ class RealtimeSession(
             )
         elif event.response.status in {"cancelled", "incomplete"}:
             status_details = event.response.status_details
-            status_type = status_details.type if status_details else None
-            status_reason = status_details.reason if status_details else None
+            if isinstance(status_details, str):
+                status_type = status_details
+                status_reason = None
+            else:
+                status_type = status_details.type if status_details else None
+                status_reason = status_details.reason if status_details else None
             logger.debug(
                 "%s response done but not complete with status: %s (type=%s, reason=%s)",
                 provider_label,
@@ -2054,14 +2113,6 @@ class RealtimeSession(
             f"{provider_label} returned an error: {event.error}",
             extra={"error": event.error},
         )
-
-        if (event_id := event.error.event_id) and (
-            fut := self._response_created_futures.pop(event_id, None)
-        ):
-            # set exception for the response future if it exists
-            if not fut.done():
-                fut.set_exception(llm.RealtimeError(event.error.message))
-
         self._emit_error(
             APIError(
                 message=f"{provider_label} returned an error",
@@ -2070,6 +2121,9 @@ class RealtimeSession(
             ),
             recoverable=True,
         )
+
+        # response errors are handled by _handle_response_done via _done_fut.
+        # error events here are for non-response errors (e.g. invalid request).
 
     def _emit_error(self, error: Exception, recoverable: bool) -> None:
         self.emit(

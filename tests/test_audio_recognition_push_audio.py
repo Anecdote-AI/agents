@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from livekit import rtc
 from livekit.agents.voice.audio_recognition import AudioRecognition
+
+pytestmark = pytest.mark.unit
 
 
 def _make_frame(byte: int = 0x11, samples: int = 160, sample_rate: int = 16000) -> rtc.AudioFrame:
@@ -25,6 +29,7 @@ def _make_recognition() -> AudioRecognition:
     ar._vad_ch = MagicMock()  # type: ignore[attr-defined]
     ar._interruption_ch = MagicMock()  # type: ignore[attr-defined]
     ar._session = MagicMock()  # type: ignore[attr-defined]
+    ar._turn_detector_stream = None  # type: ignore[attr-defined]
     return ar
 
 
