@@ -45,6 +45,7 @@ livekit-plugins-nltk = { workspace = true }
 livekit-plugins-nvidia = { workspace = true }
 livekit-plugins-openai = { workspace = true }
 livekit-plugins-perplexity = { workspace = true }
+livekit-plugins-protoface = { workspace = true }
 livekit-plugins-resemble = { workspace = true }
 livekit-plugins-respeecher = { workspace = true }
 livekit-plugins-rime = { workspace = true }
@@ -77,7 +78,6 @@ livekit-plugins-did = { workspace = true }
 members = ["livekit-plugins/*", "livekit-agents"]
 exclude = [
     "livekit-plugins/community",
-    "livekit-plugins/livekit-blingfire",
     "livekit-plugins/livekit-blockguard",
     "livekit-plugins/livekit-durable",
 ]
