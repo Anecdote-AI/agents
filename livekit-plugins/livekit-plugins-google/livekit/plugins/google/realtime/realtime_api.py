@@ -178,6 +178,10 @@ class _ResponseGeneration:
     """The timestamp when the generation is completed"""
     _done: bool = False
     """Whether the generation is done (set when the turn is complete)"""
+    _tool_calls_sent: bool = False
+    """Whether tool calls have been emitted (channels closed but audio may still be playing)"""
+    _channels_closed: bool = False
+    """Whether the generation channels have been closed"""
 
     def push_text(self, text: str) -> None:
         if self.output_text:
@@ -396,6 +400,19 @@ class RealtimeModel(llm.RealtimeModel):
             return "Vertex AI"
         else:
             return "Gemini"
+
+    @property
+    def _clarity_blocking_tools(self) -> bool:
+        """True when realtime function calls are synchronous (BLOCKING).
+
+        Supervisor-style agents omit ``tool_behavior`` (→ NOT_GIVEN → Gemini
+        blocks after toolCall until it receives the FunctionResponse); other
+        agents set ``NON_BLOCKING``. AgentActivity reads this to deliver the
+        tool result immediately for BLOCKING tools — without waiting for an
+        in-flight continuation/filler generation to drain — avoiding the
+        phantom-VAD tool-call cancellation that the wait otherwise allows.
+        """
+        return not is_given(self._opts.tool_behavior)
 
     def session(self) -> RealtimeSession:
         sess = RealtimeSession(self)
@@ -1072,14 +1089,32 @@ class RealtimeSession(llm.RealtimeSession):
                         self._reject_tool_calls(response.tool_call.function_calls or [])
                         continue
 
-                    if not self._current_generation or self._current_generation._done:
+                    if (
+                        not self._current_generation
+                        or self._current_generation._done
+                        or self._current_generation._tool_calls_sent
+                    ):
                         if (sc := response.server_content) and sc.interrupted:
                             # two cases an interrupted event is sent without an active generation
                             # 1) the generation is done but playout is not finished (turn_complete -> interrupted)
                             # 2) the generation is not started (interrupted -> turn_complete)
                             # for both cases, we interrupt the agent if there is no pending generation from `generate_reply`
                             # for the second case, the pending generation will be stopped by `turn_complete` event coming later
-                            if not self._pending_generation_fut:
+                            #
+                            # Additional case: when Gemini emits interrupted=true
+                            # in the window between tool_call dispatch
+                            # (channels closed, _tool_calls_sent=True) and
+                            # tool_response delivery (still _done=False),
+                            # Gemini's server-VAD often trips on its own
+                            # continuation/filler audio rather than real user
+                            # speech. Suppress the input_speech_started fire in
+                            # that window so the buying-time phrase plays out.
+                            is_tool_call_transition = (
+                                self._current_generation is not None
+                                and self._current_generation._tool_calls_sent
+                                and not self._current_generation._done
+                            )
+                            if not self._pending_generation_fut and not is_tool_call_transition:
                                 self._handle_input_speech_started()
 
                             sc.interrupted = None
@@ -1191,8 +1226,17 @@ class RealtimeSession(llm.RealtimeSession):
 
     def _start_new_generation(self) -> None:
         self._rejected_tool_calls = 0
+        prev_gen = self._current_generation
+        prev_had_tool_calls = prev_gen is not None and prev_gen._tool_calls_sent
+
         if self._current_generation and not self._current_generation._done:
-            logger.warning("starting new generation while another is active. Finalizing previous.")
+            # When the previous generation issued tool calls the new generation
+            # is a normal continuation (Gemini opens a fresh turn for the post-
+            # tool reply) — don't warn about that case.
+            if not self._current_generation._tool_calls_sent:
+                logger.warning(
+                    "starting new generation while another is active. Finalizing previous."
+                )
             self._mark_current_generation_done()
 
         response_id = utils.shortuuid("GR_")
@@ -1232,9 +1276,14 @@ class RealtimeSession(llm.RealtimeSession):
             generation_event.user_initiated = True
             self._pending_generation_fut.set_result(generation_event)
             self._pending_generation_fut = None
-        else:
-            # emit input_speech_started event before starting an agent initiated generation
-            # to interrupt the previous audio playout if any
+        elif not prev_had_tool_calls and prev_gen is not None and prev_gen._done:
+            # Real user barge-in: a new generation starts after a previous turn
+            # that DID complete and did NOT issue tool calls. Fire
+            # input_speech_started so AgentSession drops the buffered audio.
+            # Skipping when prev had tool calls keeps buying-time audio playing
+            # during the tool-response continuation; skipping when prev_gen is
+            # None or not done excludes the initial greeting case (nothing to
+            # interrupt).
             self._handle_input_speech_started()
 
         self.emit("generation_created", generation_event)
@@ -1307,17 +1356,21 @@ class RealtimeSession(llm.RealtimeSession):
         if server_content.turn_complete:
             self._mark_current_generation_done()
 
-    def _mark_current_generation_done(self) -> None:
-        if not self._current_generation or self._current_generation._done:
+    def _close_generation_channels(self) -> None:
+        # Closes the generation's output channels (text/audio/function/message)
+        # and commits the input/output transcripts to the chat context. Split
+        # out from _mark_current_generation_done so _handle_tool_calls can flush
+        # the tool-call channel without setting _done=True (which would
+        # otherwise trigger _start_new_generation → input_speech_started and
+        # drop the still-playing buying-time audio).
+        if not self._current_generation or self._current_generation._channels_closed:
             return
 
-        # emit input_speech_stopped event after the generation is done
+        gen = self._current_generation
+        gen._channels_closed = True
+
         self._handle_input_speech_stopped()
 
-        gen = self._current_generation
-
-        # The only way we'd know that the transcription is complete is by when they are
-        # done with generation
         if gen.input_transcription:
             self.emit(
                 "input_audio_transcription_completed",
@@ -1328,8 +1381,6 @@ class RealtimeSession(llm.RealtimeSession):
                 ),
             )
 
-            # since gemini doesn't give us a view of the chat history on the server side,
-            # we would handle it manually here
             self._chat_ctx.add_message(
                 role="user",
                 content=gen.input_transcription,
@@ -1345,17 +1396,23 @@ class RealtimeSession(llm.RealtimeSession):
 
         if not gen.text_ch.closed:
             if self._opts.output_audio_transcription is None:
-                # close the text data of transcription synchronizer
                 gen.text_ch.send_nowait("")
             gen.text_ch.close()
         if not gen.audio_ch.closed:
             gen.audio_ch.close()
+        if not gen.function_ch.closed:
+            gen.function_ch.close()
+        if not gen.message_ch.closed:
+            gen.message_ch.close()
 
-        gen.function_ch.close()
-        gen.message_ch.close()
-        gen._done = True
+    def _mark_current_generation_done(self) -> None:
+        if not self._current_generation or self._current_generation._done:
+            return
+
+        self._close_generation_channels()
+        self._current_generation._done = True
         if lk_google_debug:
-            logger.debug(f"generation done {gen}")
+            logger.debug(f"generation done {self._current_generation}")
 
     def _handle_input_speech_started(self) -> None:
         self.emit("input_speech_started", llm.InputSpeechStartedEvent())
@@ -1414,7 +1471,12 @@ class RealtimeSession(llm.RealtimeSession):
                     arguments=arguments,
                 )
             )
-        self._mark_current_generation_done()
+        # Flush the tool-call channels without marking the generation done so
+        # any buying-time audio Gemini emitted in the same turn finishes
+        # playing. _tool_calls_sent guards downstream branches that need to
+        # distinguish a tool-call continuation from a real user barge-in.
+        self._close_generation_channels()
+        gen._tool_calls_sent = True
 
     def _handle_tool_call_cancellation(
         self, tool_call_cancellation: types.LiveServerToolCallCancellation
