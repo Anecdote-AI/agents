@@ -124,10 +124,14 @@ class LLM(llm.LLM):
         super().__init__()
 
         if not is_given(reasoning_effort) and _supports_reasoning_effort(model):
-            if model in ["gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.4-mini"]:
-                reasoning_effort = "none"
-            else:
+            if model in ["gpt-5", "gpt-5-mini", "gpt-5-nano"]:
+                # the original gpt-5 generation has no "none" level
                 reasoning_effort = "minimal"
+            else:
+                # dotted gpt-5.x generations: voice agents default to no
+                # thinking (TTFT), and gpt-5.6 rejects function tools on Chat
+                # Completions unless reasoning_effort is "none".
+                reasoning_effort = "none"
 
         self._opts = _LLMOptions(
             model=model,
