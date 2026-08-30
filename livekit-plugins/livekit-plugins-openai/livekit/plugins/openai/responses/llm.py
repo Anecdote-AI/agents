@@ -242,10 +242,13 @@ class LLM(llm.LLM):
         super().__init__()
 
         if not is_given(reasoning) and _supports_reasoning_effort(model):
-            if model in ["gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.4-mini"]:
-                reasoning = Reasoning(effort="none")
-            else:
+            if model in ["gpt-5", "gpt-5-mini", "gpt-5-nano"]:
+                # the original gpt-5 generation has no "none" level
                 reasoning = Reasoning(effort="minimal")
+            else:
+                # dotted gpt-5.x generations: same no-thinking default as the
+                # Chat Completions constructor (llm.py) — keep the two in sync.
+                reasoning = Reasoning(effort="none")
 
         if client is not None and use_websocket:
             logger.warning("use_websocket is ignored when a custom client is provided, disabling")
