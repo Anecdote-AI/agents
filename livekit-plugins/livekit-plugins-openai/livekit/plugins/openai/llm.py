@@ -124,14 +124,10 @@ class LLM(llm.LLM):
         super().__init__()
 
         if not is_given(reasoning_effort) and _supports_reasoning_effort(model):
-            if model in ["gpt-5", "gpt-5-mini", "gpt-5-nano"]:
-                # the original gpt-5 generation has no "none" level
-                reasoning_effort = "minimal"
-            else:
-                # dotted gpt-5.x generations: voice agents default to no
-                # thinking (TTFT), and gpt-5.6 rejects function tools on Chat
-                # Completions unless reasoning_effort is "none".
+            if model in ["gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.4-mini"]:
                 reasoning_effort = "none"
+            else:
+                reasoning_effort = "minimal"
 
         self._opts = _LLMOptions(
             model=model,
@@ -179,7 +175,13 @@ class LLM(llm.LLM):
             ),
         )
 
+    async def _prewarm_impl(self) -> None:
+        # token-free request supported by openai and openai-compatible servers
+        await self._client.models.list()
+
     async def aclose(self) -> None:
+        await super().aclose()
+
         if self._owns_client:
             await self._client.close()
 
@@ -262,7 +264,7 @@ class LLM(llm.LLM):
     @staticmethod
     def with_cerebras(
         *,
-        model: str | CerebrasChatModels = "llama-4-scout-17b-16e-instruct",
+        model: str | CerebrasChatModels = "gpt-oss-120b",
         api_key: str | None = None,
         base_url: str = "https://api.cerebras.ai/v1",
         client: openai.AsyncClient | None = None,

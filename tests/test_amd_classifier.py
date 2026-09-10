@@ -63,6 +63,22 @@ def _machine_vm_response(transcript: str = "voicemail greeting") -> FakeLLMRespo
     )
 
 
+def _human_response(transcript: str = "hello") -> FakeLLMResponse:
+    return FakeLLMResponse(
+        input=transcript,
+        content="",
+        ttft=0.0,
+        duration=0.05,
+        tool_calls=[
+            FunctionToolCall(
+                name="save_prediction",
+                arguments='{"label": "human"}',
+                call_id="c1",
+            )
+        ],
+    )
+
+
 class TestAMDClassifier:
     """Tests for ``_AMDClassifier`` silence-timer behaviour."""
 
@@ -389,6 +405,46 @@ class TestAMDClassifier:
 
         await clf.close()
 
+    async def test_start_detection_timer_resets_existing_timer(self) -> None:
+        clf = _make_classifier(timeout=0.4)
+        clf.start_listening()
+        results: list[AMDPredictionEvent] = []
+        clf.on("amd_prediction", results.append)
+
+        clf.start_detection_timer()
+        first_timer = clf._detection_timeout_timer
+        assert first_timer is not None
+
+        await asyncio.sleep(0.25)
+        clf.start_detection_timer()
+        assert clf._detection_timeout_timer is not None
+        assert clf._detection_timeout_timer is not first_timer
+
+        await asyncio.sleep(0.25)
+        assert results == []
+
+        await asyncio.wait_for(clf._verdict_ready.wait(), timeout=1.0)
+        assert results[0].reason == "detection_timeout"
+
+        await clf.close()
+
+    async def test_settled_classifier_rejects_new_timers_and_listening(self) -> None:
+        clf = _make_classifier(no_speech_threshold=0.2)
+        clf.start_listening()
+
+        await asyncio.wait_for(clf._verdict_ready.wait(), timeout=1.0)
+        assert clf._emitted is True
+        assert clf._detection_timeout_timer is None
+        assert clf.listening is False
+
+        clf.start_detection_timer()
+        clf.start_listening()
+
+        assert clf._detection_timeout_timer is None
+        assert clf.listening is False
+
+        await clf.close()
+
     async def test_emit_cancels_timers(self) -> None:
         """Timers are cancelled at successful emission, not at verdict-set."""
         llm = FakeLLM(fake_responses=[_machine_vm_response("voicemail")])
@@ -459,8 +515,8 @@ class TestAMDClassifier:
 
         await clf.close()
 
-    async def test_eot_backstop_emits_machine_without_turn_detector(self) -> None:
-        """The synthetic end-of-turn backstop (max_endpointing_delay) lets a
+    async def test_max_endpointing_delay_emits_machine_without_turn_detector(self) -> None:
+        """The synthetic max-endpointing EOT lets a
         machine verdict emit even if on_end_of_turn() is never called."""
         llm = FakeLLM(fake_responses=[_machine_vm_response("voicemail")])
         clf = _make_classifier(
@@ -487,11 +543,26 @@ class TestAMDClassifier:
         assert clf._eot_reached is False
         assert results == []
 
-        # the eot backstop (0.4) fires without any on_end_of_turn() call → emit
+        # the max endpointing delay (0.4) fires without any on_end_of_turn() call → emit
         await asyncio.wait_for(clf._verdict_ready.wait(), timeout=1.0)
         assert clf._eot_reached is True
         assert len(results) == 1
         assert results[0].category == AMDCategory.MACHINE_VM
+
+        await clf.close()
+
+    async def test_max_endpointing_delay_accounts_for_elapsed_silence_on_eos(self) -> None:
+        clf = _make_classifier(human_speech_threshold=0.05, max_endpointing_delay=0.4)
+        clf.start_listening()
+
+        clf.on_user_speech_started()
+        await asyncio.sleep(0.1)
+        clf.on_user_speech_ended(silence_duration=0.25)
+
+        await asyncio.sleep(0.2)
+
+        assert clf._eot_reached is True
+        assert clf._eot_timer is None
 
         await clf.close()
 
@@ -527,8 +598,48 @@ class TestAMDClassifier:
 
         await clf.close()
 
+    async def test_detection_timeout_preserves_transcript(self) -> None:
+        llm = FakeLLM(
+            fake_responses=[
+                FakeLLMResponse(
+                    input="hello",
+                    content="",
+                    ttft=0.0,
+                    duration=0.05,
+                    tool_calls=[
+                        FunctionToolCall(
+                            name="save_prediction",
+                            arguments='{"label": "uncertain"}',
+                            call_id="c1",
+                        )
+                    ],
+                )
+            ]
+        )
+        clf = _make_classifier(
+            llm=llm,
+            timeout=0.4,
+            wait_until_finished=True,
+            max_endpointing_delay=0.2,
+        )
+        clf.start_listening()
+        clf.start_detection_timer()
+        results: list[AMDPredictionEvent] = []
+        clf.on("amd_prediction", results.append)
+
+        clf.push_text("hello")
+
+        await asyncio.wait_for(clf._verdict_ready.wait(), timeout=1.0)
+
+        assert len(results) == 1
+        assert results[0].category == AMDCategory.UNCERTAIN
+        assert results[0].reason == "detection_timeout"
+        assert results[0].transcript == "hello"
+
+        await clf.close()
+
     async def test_speech_restart_cancels_eot_backstop(self) -> None:
-        """on_user_speech_started cancels the eot backstop and resets the gate."""
+        """on_user_speech_started cancels the EOT timer and resets the gate."""
         clf = _make_classifier(human_speech_threshold=0.05, max_endpointing_delay=0.3)
         clf.start_listening()
 
@@ -545,5 +656,124 @@ class TestAMDClassifier:
         # well past the original backstop deadline → still not reached
         await asyncio.sleep(0.4)
         assert clf._eot_reached is False
+
+        await clf.close()
+
+    async def test_max_endpointing_delay_emits_human_without_vad_boundaries(self) -> None:
+        """A final transcript can complete AMD without VAD boundaries."""
+        clf = _make_classifier(
+            llm=FakeLLM(fake_responses=[_human_response()]),
+            timeout=5.0,
+            max_endpointing_delay=0.3,
+        )
+        clf.start_listening()
+        clf.start_detection_timer()
+        results: list[AMDPredictionEvent] = []
+        clf.on("amd_prediction", results.append)
+
+        clf.push_text("hello")
+        assert clf._eot_timer is not None
+
+        await asyncio.sleep(0.4)
+
+        assert clf._eot_reached is True
+        assert clf._eot_timer is None
+        assert len(results) == 1
+        assert results[0].category == AMDCategory.HUMAN
+        assert results[0].reason == "llm"
+
+        await clf.close()
+
+    async def test_max_endpointing_delay_emits_machine_without_vad_boundaries(self) -> None:
+        clf = _make_classifier(
+            llm=FakeLLM(fake_responses=[_machine_vm_response()]),
+            timeout=5.0,
+            max_endpointing_delay=0.3,
+        )
+        clf.start_listening()
+        clf.start_detection_timer()
+        results: list[AMDPredictionEvent] = []
+        clf.on("amd_prediction", results.append)
+
+        clf.push_text("voicemail greeting")
+
+        await asyncio.sleep(0.2)
+        assert clf._verdict_result is not None
+        assert results == []
+
+        await asyncio.sleep(0.2)
+
+        assert len(results) == 1
+        assert results[0].category == AMDCategory.MACHINE_VM
+
+        await clf.close()
+
+    async def test_transcript_eot_waits_for_latest_chunk(self) -> None:
+        llm = FakeLLM(
+            fake_responses=[
+                _human_response("hello"),
+                _machine_vm_response("hello you've reached"),
+            ]
+        )
+        clf = _make_classifier(llm=llm, timeout=5.0, max_endpointing_delay=0.3)
+        clf.start_listening()
+        clf.start_detection_timer()
+        results: list[AMDPredictionEvent] = []
+        clf.on("amd_prediction", results.append)
+
+        clf.push_text("hello")
+        await asyncio.sleep(0.2)
+        assert clf._verdict_result is not None
+        assert clf._verdict_result.category == AMDCategory.HUMAN
+        assert results == []
+
+        clf.push_text("you've reached")
+        await asyncio.sleep(0.2)
+        assert clf._verdict_result is not None
+        assert clf._verdict_result.category == AMDCategory.MACHINE_VM
+        assert results == []
+
+        await asyncio.sleep(0.2)
+
+        assert len(results) == 1
+        assert results[0].category == AMDCategory.MACHINE_VM
+
+        await clf.close()
+
+    async def test_transcript_rearms_max_endpointing_delay_after_eos(self) -> None:
+        """A post-EOS transcript re-arms the synthetic EOT timer."""
+        clf = _make_classifier(human_speech_threshold=0.05, max_endpointing_delay=0.4)
+        clf.start_listening()
+
+        clf.on_user_speech_started()
+        await asyncio.sleep(0.1)
+        clf.on_user_speech_ended(silence_duration=0.0)
+        first_timer = clf._eot_timer
+        assert first_timer is not None
+
+        await asyncio.sleep(0.25)
+        clf.push_text("voicemail greeting")
+        assert clf._eot_timer is not None
+        assert clf._eot_timer is not first_timer
+
+        await asyncio.sleep(0.25)
+        assert clf._eot_reached is False
+
+        await asyncio.sleep(0.25)
+        assert clf._eot_reached is True
+
+        await clf.close()
+
+    async def test_settle_emits_uncertain_before_listening(self) -> None:
+        clf = _make_classifier()
+        results: list[AMDPredictionEvent] = []
+        clf.on("amd_prediction", results.append)
+
+        clf.settle(AMDCategory.UNCERTAIN, reason="participant_missing")
+
+        assert len(results) == 1
+        assert results[0].category == AMDCategory.UNCERTAIN
+        assert results[0].reason == "participant_missing"
+        assert clf._verdict_ready.is_set()
 
         await clf.close()

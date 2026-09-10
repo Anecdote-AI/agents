@@ -1,10 +1,10 @@
-import re
 from dataclasses import dataclass
 from typing import Literal, TypedDict
 
 from openai.types import AudioModel
 
-STTModels = AudioModel
+# AudioModel covers the transcriptions endpoint; these two are served only over realtime
+STTModels = AudioModel | Literal["gpt-live-transcribe", "gpt-realtime-whisper"]
 TTSModels = Literal["tts-1", "tts-1-hd", "gpt-4o-mini-tts"]
 TTSVoices = Literal[
     "alloy",
@@ -20,6 +20,7 @@ TTSVoices = Literal[
 ]
 DalleModels = Literal["dall-e-2", "dall-e-3"]
 ChatModels = Literal[
+    "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.3-chat-latest",
@@ -109,15 +110,9 @@ NebiusChatModels = Literal[
 ]
 
 CerebrasChatModels = Literal[
-    "llama3.1-8b",
-    "llama-3.3-70b",
-    "llama-4-scout-17b-16e-instruct",
-    "llama-4-maverick-17b-128e-instruct",
-    "qwen-3-32b",
-    "qwen-3-235b-a22b-instruct-2507",
-    "qwen-3-235b-a22b-thinking-2507",
-    "qwen-3-coder-480b",
     "gpt-oss-120b",
+    "zai-glm-4.7",
+    "gemma-4-31b",
 ]
 
 PerplexityChatModels = Literal[
@@ -294,19 +289,13 @@ SambaNovaChatModels = Literal[
 ]
 
 
-# Every dotted gpt-5 generation (gpt-5.1+, incl. -mini/-nano and named variants
-# like gpt-5.6-sol) accepts `reasoning_effort`, and the gpt-5.6 line REQUIRES
-# reasoning_effort="none" for function tools to work over Chat Completions at
-# all — so an allow-list that lags a release silently degrades latency
-# (gpt-5.5) or 400s every tool call (gpt-5.6). Match by shape instead of
-# enumerating; "-chat" tunes are non-reasoning variants and take no effort.
-_GPT5_DOTTED = re.compile(r"^gpt-5\.\d")
-
-
 def _supports_reasoning_effort(model: ChatModels | str) -> bool:
-    if _GPT5_DOTTED.match(model) and "-chat" not in model:
-        return True
     return model in [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.2",
+        "gpt-5.1",
         "gpt-5",
         "gpt-5-mini",
         "gpt-5-nano",

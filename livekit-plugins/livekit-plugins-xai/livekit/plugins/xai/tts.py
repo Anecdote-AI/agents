@@ -112,7 +112,9 @@ class TTS(tts.TTS):
         self._pool = utils.ConnectionPool[aiohttp.ClientWebSocketResponse](
             connect_cb=self._connect_pooled_ws,
             close_cb=self._close_pooled_ws,
-            max_session_duration=3600,
+            # xAI's TTS server enforces an undocumented ~2100s deadline per websocket
+            # connection; stay below it so connections rotate before the server kills them
+            max_session_duration=1800,
             mark_refreshed_on_get=False,
         )
 
@@ -154,12 +156,16 @@ class TTS(tts.TTS):
                 ),
                 timeout,
             )
-        except (
-            aiohttp.ClientConnectorError,
-            aiohttp.ClientConnectionResetError,
-            asyncio.TimeoutError,
-        ) as e:
-            raise APIConnectionError("failed to connect to xAI") from e
+        except asyncio.TimeoutError:
+            raise APIConnectionError("failed to connect to xAI") from None
+        except aiohttp.ClientResponseError as e:
+            # RequestInfo carries the request headers, so chaining this error or
+            # formatting it puts the API key in the exception repr (#6739).
+            raise APIStatusError(
+                message=e.message, status_code=e.status, request_id=None, body=None
+            ) from None
+        except Exception as e:
+            raise APIConnectionError(f"failed to connect to xAI ({type(e).__name__})") from None
         return ws
 
     async def _close_ws(self, ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -360,7 +366,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                         body=str(data),
                     )
                 else:
-                    logger.warning("Unexpected xAI message %s", data)
+                    logger.warning("Unexpected xAI message", extra={"lk.pii.data": data})
 
         async with self._tts._pool.connection(timeout=self._conn_options.timeout) as ws:
             self._acquire_time = self._tts._pool.last_acquire_time
