@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from typing import Literal, TypedDict
 
@@ -289,13 +290,19 @@ SambaNovaChatModels = Literal[
 ]
 
 
+# Every dotted gpt-5 generation (gpt-5.1+, incl. -mini/-nano and named variants
+# like gpt-5.6-sol) accepts `reasoning_effort`, and the gpt-5.6 line REQUIRES
+# reasoning_effort="none" for function tools to work over Chat Completions at
+# all — so an allow-list that lags a release silently degrades latency
+# (gpt-5.5) or 400s every tool call (gpt-5.6). Match by shape instead of
+# enumerating; "-chat" tunes are non-reasoning variants and take no effort.
+_GPT5_DOTTED = re.compile(r"^gpt-5\.\d")
+
+
 def _supports_reasoning_effort(model: ChatModels | str) -> bool:
+    if _GPT5_DOTTED.match(model) and "-chat" not in model:
+        return True
     return model in [
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.2",
-        "gpt-5.1",
         "gpt-5",
         "gpt-5-mini",
         "gpt-5-nano",
