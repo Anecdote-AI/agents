@@ -2,6 +2,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal, TypedDict
 
+from livekit.agents.llm._realtime.openai_types import RealtimeModels as RealtimeModels
 from openai.types import AudioModel
 
 # AudioModel covers the transcriptions endpoint; these two are served only over realtime
@@ -59,13 +60,6 @@ ChatModels = Literal[
     "gpt-3.5-turbo-0613",
     "gpt-3.5-turbo-1106",
     "gpt-3.5-turbo-16k-0613",
-]
-RealtimeModels = Literal[
-    "gpt-realtime",
-    "gpt-realtime-1.5",
-    "gpt-realtime-2",
-    "gpt-realtime-2025-08-28",
-    "gpt-4o-realtime-preview",
 ]
 EmbeddingModels = Literal[
     "text-embedding-ada-002", "text-embedding-3-small", "text-embedding-3-large"
@@ -167,17 +161,6 @@ CometAPIChatModels = Literal[
     # Qwen series
     "qwen3-30b-a3b",
     "qwen3-coder-plus-2025-07-22",
-]
-
-VertexModels = Literal[
-    "google/gemini-2.0-flash-exp",
-    "google/gemini-1.5-flash",
-    "google/gemini-1.5-pro",
-    "google/gemini-1.0-pro-vision",
-    "google/gemini-1.0-pro-vision-001",
-    "google/gemini-1.0-pro-002",
-    "google/gemini-1.0-pro-001",
-    "google/gemini-1.0-pro",
 ]
 
 TogetherChatModels = Literal[
